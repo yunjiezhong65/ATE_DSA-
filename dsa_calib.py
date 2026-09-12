@@ -51,6 +51,8 @@ BOARD_SURVIVAL_WARN = 0.75
 BOARD_CENTER_WARN_SIGMA = 3.0
 BOARD_SPREAD_WARN_RATIO = 1.5
 COV_EPS = 1e-12
+# 全局模型是否对每块板等量抽样：False = 全部通道参与；True = 按中位通道数封顶
+GLOBAL_BALANCED = False
 
 def voltage_to_v(s):
     m = re.match(r'([-+]?(?:\d+(?:\.\d*)?|\.\d+))(mV|V)$', str(s).strip(), re.I)
@@ -456,19 +458,29 @@ def board_filter(models, conf):
         fs.append(d[d['step1_is_ok']].copy())
     return (pd.concat(fs, ignore_index=True) if fs else pd.DataFrame()), c
 
-def fit_global_balanced(df, fit_conf, support):
+def fit_global_balanced(df, fit_conf, support, balanced=None):
+    """全局模型拟合。
+    balanced=True  → 每块板按中位通道数封顶后再拼（防大板主导）
+    balanced=False → 全部通过通道参与
+    balanced=None  → 使用模块级 GLOBAL_BALANCED 默认值
+    """
+    if balanced is None:
+        balanced = GLOBAL_BALANCED
     if df.empty: return None
     gs = []
     for _, g in df.groupby('test_run_id', sort=False):
         g = g[np.all(np.isfinite(g[['k', 'b']].values), axis=1)]
         if len(g): gs.append(g)
     if not gs: return None
-    target = max(5, int(np.median([len(g) for g in gs])))
-    parts = []
-    for g in gs: parts.append(g.sample(target, random_state=42) if len(g) > target else g)
-    bal = pd.concat(parts, ignore_index=True)
+    if balanced:
+        target = max(5, int(np.median([len(g) for g in gs])))
+        parts = [g.sample(target, random_state=42) if len(g) > target else g for g in gs]
+        bal = pd.concat(parts, ignore_index=True)
+    else:
+        target = None
+        bal = pd.concat(gs, ignore_index=True)
     m = fit_rmcd(bal[['k', 'b']].values, fit_conf, support)
-    return {'model': m, 'fit_df': bal, 'target_per_run': target, 'run_count': len(parts)}
+    return {'model': m, 'fit_df': bal, 'target_per_run': target, 'run_count': len(gs), 'balanced': balanced}
 
 def apply_global(df, model, conf):
     if df.empty or model is None: return pd.DataFrame(), cutoff(conf)
@@ -520,6 +532,7 @@ class App:
         self.stats = pd.DataFrame(); self.baseline = None
         self.fit_conf = 0.975; self.board_conf = 0.95; self.global_conf = 0.95; self.support = 0.85
         self.map = {}
+        self.balanced = GLOBAL_BALANCED
         self.build()
 
     def build(self):
@@ -559,7 +572,11 @@ class App:
         self.sg.pack()
         self.lg = ttk.Label(left, text=f'全局判定：{self.global_conf * 100:.1f}%')
         self.lg.pack(anchor='w', pady=(1, 8))
-        
+
+        self.bal_var = tk.BooleanVar(value=self.balanced)
+        ttk.Checkbutton(left, text='全局模型：每块板等量抽样（防大板主导）',
+                variable=self.bal_var, command=self.toggle_balanced).pack(anchor='w', pady=(0, 6))
+
         ttk.Button(left, text='▶ 强制重新拟合全部模型', command=self.fit_all).pack(fill='x', pady=3)
         ttk.Separator(left).pack(fill='x', pady=6)
         
@@ -653,6 +670,10 @@ class App:
         self.lg.config(text=f'全局判定：{self.global_conf * 100:.1f}%')
         self.update_judgement()
 
+    def toggle_balanced(self):
+        self.balanced = bool(self.bal_var.get())
+        self.update_global()
+
     def fit_all(self):
         self.dataset = self.ds.get()
         if not self.dataset or not self.tests: return
@@ -666,7 +687,7 @@ class App:
         if inp.empty:
             self.global_model = None; self.global_df = pd.DataFrame(); self.stats = pd.DataFrame()
             self.draw_all(); return
-        g = fit_global_balanced(inp, self.fit_conf, self.support)
+        g = fit_global_balanced(inp, self.fit_conf, self.support, balanced=self.balanced)
         if not g:
             self.global_model = None; self.global_df = pd.DataFrame(); self.stats = pd.DataFrame()
             self.draw_all(); return
